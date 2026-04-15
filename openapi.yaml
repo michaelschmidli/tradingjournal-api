@@ -3,7 +3,7 @@ info:
   title: 91 Tradingjournal Export API
   version: 1.0.0
 servers:
-  - url: https://DEINE-DOMAIN.TLD
+  - url: https://tradingjournal-api.onrender.com
 paths:
   /health:
     get:
