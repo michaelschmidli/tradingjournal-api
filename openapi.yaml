@@ -1,0 +1,57 @@
+openapi: 3.1.0
+info:
+  title: 91 Tradingjournal Export API
+  version: 1.0.0
+servers:
+  - url: https://DEINE-DOMAIN.TLD
+paths:
+  /health:
+    get:
+      operationId: health
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+  /create-export:
+    post:
+      operationId: createExport
+      summary: Erzeugt JSON und PDF, speichert beides in Dropbox und gibt Download-Links zurück
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_key, trade]
+              properties:
+                api_key:
+                  type: string
+                trade:
+                  type: object
+                  additionalProperties: true
+      responses:
+        '200':
+          description: Export erfolgreich
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  trade_id:
+                    type: string
+                  json_file:
+                    type: object
+                    properties:
+                      path:
+                        type: string
+                      url:
+                        type: string
+                  pdf_file:
+                    type: object
+                    properties:
+                      path:
+                        type: string
+                      url:
+                        type: string
