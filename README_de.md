@@ -1,54 +1,84 @@
-# 91 Tradingjournal – Backend Lösung 3 (Fix)
+# 91 Tradingjournal – Backend Lösung mit Dropbox Refresh Token
 
-Dieses Paket behebt den aktuellen Fehler zwischen Chatbot und Backend, **ohne die Abfrage-Logik im Chat zu ändern**.
+Dieses Paket löst dein aktuelles Dropbox-Problem dauerhaft sauberer:
 
-## Was wurde korrigiert?
+Custom GPT fragt den Trade ab → ruft eine Action auf → Backend erzeugt JSON + PDF → Dropbox Access Token wird bei Bedarf automatisch über Refresh Token erneuert → direkte Download-Links werden zurückgegeben.
 
-### 1. OpenAPI-Schema präzisiert
-Der Fehler `UnrecognizedKwargsError: trade` entsteht typischerweise dann, wenn die GPT-Action das Request-Schema nicht sauber als festes Objekt erkennt.
+## Dateien
+- `app.py` – FastAPI Backend mit Dropbox Refresh-Token-Support
+- `requirements.txt` – Python-Abhängigkeiten
+- `.env.example` – Beispiel für Umgebungsvariablen (optional selbst anlegen)
+- `openapi.yaml` – Schema für die GPT Action
 
-Deshalb wurde `openapi.yaml` geändert:
-- klares `CreateExportRequest`-Schema
-- `api_key` und `trade` jetzt explizit als Pflichtfelder
-- `trade_id` im Trade-Payload explizit als Pflichtfeld
-- feste Response-Schemas ergänzt
+## Neue Dropbox-Umgebungsvariablen
+Empfohlen ist jetzt **nicht mehr** ein statischer `DROPBOX_ACCESS_TOKEN`, sondern diese 3 Variablen:
 
-### 2. Backend robuster gemacht
-Das Backend akzeptiert jetzt zusätzlich Wrapper-Formen, die bei Actions gelegentlich auftreten können, z. B.:
-- `payload`
-- `data`
-- `input`
-- `kwargs`
-- JSON-Strings statt echter Objekte
-- Root-Level-Trade-Felder
+- `DROPBOX_REFRESH_TOKEN`
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
 
-Dadurch bricht der Export auch dann nicht sofort, wenn die Action den Body leicht anders übergibt.
+Optional und weiterhin unterstützt:
+- `DROPBOX_ACCESS_TOKEN` (nur Fallback / alt)
+- `DROPBOX_ROOT`
+- `API_KEY`
 
-### 3. Automatische Unified-Felder ergänzt
-Falls noch nicht gesetzt, werden jetzt automatisch ergänzt:
-- `date`
-- `metrics.hold_time_minutes`
-- `metrics.net_profit_after_fees`
-- `metrics.win_flag`
-- `metrics.loss_flag`
-- `metrics.weekday`
-- `risk_reward`
-- `risk_per_trade_r`
+## Empfohlenes Setup in Render
+Setze in Render unter **Environment** mindestens:
 
-Damit bleibt das Unified-Format konsistent.
+- `API_KEY`
+- `DROPBOX_REFRESH_TOKEN`
+- `DROPBOX_APP_KEY`
+- `DROPBOX_APP_SECRET`
+- optional `DROPBOX_ROOT`
 
-## Wichtig
-Die Chatbot-Abfrage selbst wird dadurch **nicht verändert**.
-Nur die Schnittstelle zwischen GPT-Action und Backend wurde stabilisiert.
+Danach **neu deployen**.
 
-## Deployment
-Nach dem Austausch der Dateien bitte:
+## Verhalten der neuen Version
+Die neue Version verwendet automatisch:
 
-1. Backend neu deployen
-2. im GPT-Builder die Action mit der neuen `openapi.yaml` erneut speichern / neu importieren
-3. Test mit einem echten Export durchführen
+1. Refresh Token Flow, wenn `DROPBOX_REFRESH_TOKEN` vorhanden ist
+2. sonst alten `DROPBOX_ACCESS_TOKEN` als Fallback
 
-## Enthaltene Dateien
-- `app.py`
-- `openapi.yaml`
-- `README_de.md`
+Zusätzlich prüft das Backend die Dropbox-Authentifizierung direkt beim Aufbau des Clients. Dadurch bekommst du früh eine klare Fehlermeldung statt eines späten Upload-Fehlers.
+
+## Schnellstart
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app:app --host 0.0.0.0 --port 8000
+```
+
+## Render: Schritt für Schritt
+1. `app.py` ersetzen
+2. In Render → **Environment**:
+   - alten `DROPBOX_ACCESS_TOKEN` optional drin lassen oder später entfernen
+   - `DROPBOX_REFRESH_TOKEN` eintragen
+   - `DROPBOX_APP_KEY` eintragen
+   - `DROPBOX_APP_SECRET` eintragen
+3. speichern
+4. Deploy neu starten
+5. `/health` testen
+6. danach `createExport` testen
+
+## GPT Action
+Die `openapi.yaml` bleibt für den GPT-Builder gleich nutzbar:
+- Auth = `None`
+- `api_key` wird weiterhin im Body gesendet
+- `trade` bleibt weiterhin im Body
+
+## Rückgabe der API
+```json
+{
+  "success": true,
+  "trade_id": "2026-02-25-01",
+  "json_file": {
+    "path": "/91 Tradingjournal/json/2026-02-25-01.json",
+    "url": "..."
+  },
+  "pdf_file": {
+    "path": "/91 Tradingjournal/pdf/2026-02-25-01.pdf",
+    "url": "..."
+  }
+}
+```
