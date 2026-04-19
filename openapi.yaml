@@ -12,6 +12,7 @@ paths:
       responses:
         '200':
           description: OK
+
   /create-export:
     post:
       operationId: createExport
@@ -22,13 +23,18 @@ paths:
           application/json:
             schema:
               type: object
-              required: [api_key, trade]
+              additionalProperties: false
+              required:
+                - api_key
+                - trade
               properties:
                 api_key:
                   type: string
+                  description: Geheimer API-Key für das Backend
                 trade:
                   type: object
                   additionalProperties: true
+                  description: Vollständiges Trade-Objekt im Unified-Format
       responses:
         '200':
           description: Export erfolgreich
@@ -36,6 +42,7 @@ paths:
             application/json:
               schema:
                 type: object
+                additionalProperties: false
                 properties:
                   success:
                     type: boolean
@@ -43,6 +50,7 @@ paths:
                     type: string
                   json_file:
                     type: object
+                    additionalProperties: false
                     properties:
                       path:
                         type: string
@@ -50,6 +58,7 @@ paths:
                         type: string
                   pdf_file:
                     type: object
+                    additionalProperties: false
                     properties:
                       path:
                         type: string
