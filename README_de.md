@@ -1,70 +1,54 @@
-# 91 Tradingjournal – Backend Lösung 3
+# 91 Tradingjournal – Backend Lösung 3 (Fix)
 
-Dieses Paket löst genau dein Problem:
+Dieses Paket behebt den aktuellen Fehler zwischen Chatbot und Backend, **ohne die Abfrage-Logik im Chat zu ändern**.
 
-Custom GPT fragt den Trade ab → ruft eine Action auf → Backend erzeugt JSON + PDF → speichert beides in Dropbox → gibt direkte Download-Links zurück.
+## Was wurde korrigiert?
 
-## Dateien
-- `app.py` – FastAPI Backend
-- `requirements.txt` – Python-Abhängigkeiten
-- `.env.example` – Umgebungsvariablen
-- `openapi.yaml` – Schema für die GPT Action
+### 1. OpenAPI-Schema präzisiert
+Der Fehler `UnrecognizedKwargsError: trade` entsteht typischerweise dann, wenn die GPT-Action das Request-Schema nicht sauber als festes Objekt erkennt.
 
-## Schnellstart
+Deshalb wurde `openapi.yaml` geändert:
+- klares `CreateExportRequest`-Schema
+- `api_key` und `trade` jetzt explizit als Pflichtfelder
+- `trade_id` im Trade-Payload explizit als Pflichtfeld
+- feste Response-Schemas ergänzt
 
-### 1) Python-Umgebung
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+### 2. Backend robuster gemacht
+Das Backend akzeptiert jetzt zusätzlich Wrapper-Formen, die bei Actions gelegentlich auftreten können, z. B.:
+- `payload`
+- `data`
+- `input`
+- `kwargs`
+- JSON-Strings statt echter Objekte
+- Root-Level-Trade-Felder
 
-### 2) `.env` anlegen
-Kopiere `.env.example` nach `.env` und trage ein:
-- `API_KEY`
-- `DROPBOX_ACCESS_TOKEN`
-- optional `DROPBOX_ROOT`
+Dadurch bricht der Export auch dann nicht sofort, wenn die Action den Body leicht anders übergibt.
 
-### 3) Server starten
-```bash
-uvicorn app:app --host 0.0.0.0 --port 8000
-```
+### 3. Automatische Unified-Felder ergänzt
+Falls noch nicht gesetzt, werden jetzt automatisch ergänzt:
+- `date`
+- `metrics.hold_time_minutes`
+- `metrics.net_profit_after_fees`
+- `metrics.win_flag`
+- `metrics.loss_flag`
+- `metrics.weekday`
+- `risk_reward`
+- `risk_per_trade_r`
 
-### 4) GPT Action einrichten
-Im GPT-Builder:
-- Configure
-- Actions
-- `openapi.yaml` einfügen
-- als Auth `None` lassen, weil der `api_key` im Body mitgeschickt wird
-  (oder alternativ auf Bearer/Auth umbauen)
+Damit bleibt das Unified-Format konsistent.
 
-### 5) In den GPT-Instructions ergänzen
-Nach Bestätigung mit „Ja“:
-- Unified-Trade-Objekt aufbauen
-- Action `create-export` aufrufen
-- `api_key` mitsenden
-- `trade` mitsenden
-- dem Nutzer die beiden zurückgegebenen Download-Links zeigen
+## Wichtig
+Die Chatbot-Abfrage selbst wird dadurch **nicht verändert**.
+Nur die Schnittstelle zwischen GPT-Action und Backend wurde stabilisiert.
 
-## Dropbox-Zielordner
-Standard:
-- `/91 Tradingjournal/json`
-- `/91 Tradingjournal/pdf`
+## Deployment
+Nach dem Austausch der Dateien bitte:
 
-Kann über `DROPBOX_ROOT` geändert werden.
+1. Backend neu deployen
+2. im GPT-Builder die Action mit der neuen `openapi.yaml` erneut speichern / neu importieren
+3. Test mit einem echten Export durchführen
 
-## Rückgabe der API
-```json
-{
-  "success": true,
-  "trade_id": "2026-02-25-01",
-  "json_file": {
-    "path": "/91 Tradingjournal/json/2026-02-25-01.json",
-    "url": "..."
-  },
-  "pdf_file": {
-    "path": "/91 Tradingjournal/pdf/2026-02-25-01.pdf",
-    "url": "..."
-  }
-}
-```
+## Enthaltene Dateien
+- `app.py`
+- `openapi.yaml`
+- `README_de.md`
