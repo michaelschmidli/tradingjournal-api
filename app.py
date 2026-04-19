@@ -4,6 +4,7 @@ import io
 import json
 import os
 import textwrap
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 import dropbox
@@ -21,7 +22,7 @@ DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/91 Tradingjournal")
 API_KEY = os.getenv("API_KEY", "")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "")
 
-app = FastAPI(title=APP_TITLE, version="1.1.0")
+app = FastAPI(title=APP_TITLE, version="1.2.0")
 
 
 class TradePayload(BaseModel):
@@ -45,6 +46,23 @@ class TradePayload(BaseModel):
     attachments: Dict[str, Any] = Field(default_factory=dict)
 
 
+class CreateExportRequest(BaseModel):
+    api_key: str
+    trade: TradePayload
+
+
+class FileInfo(BaseModel):
+    path: str
+    url: str
+
+
+class CreateExportResponse(BaseModel):
+    success: bool
+    trade_id: str
+    json_file: FileInfo
+    pdf_file: FileInfo
+
+
 def _require_api_key(given: Optional[str]) -> None:
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API_KEY is not configured on the server.")
@@ -59,7 +77,7 @@ def _require_dropbox_client() -> dropbox.Dropbox:
 
 
 def _as_text(value: Any) -> str:
-    if value is None:
+    if value is None or value == "":
         return "-"
     if isinstance(value, float):
         return f"{value:.2f}"
@@ -68,36 +86,107 @@ def _as_text(value: Any) -> str:
     return str(value)
 
 
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    raw = value.strip()
+    candidates = [raw]
+    if raw.endswith("Z"):
+        candidates.append(raw[:-1] + "+00:00")
+    if " " in raw and "T" not in raw:
+        candidates.append(raw.replace(" ", "T", 1))
+
+    for item in candidates:
+        try:
+            return datetime.fromisoformat(item)
+        except ValueError:
+            continue
+    return None
+
+
+def _ensure_derived_fields(trade: TradePayload) -> TradePayload:
+    metrics = dict(trade.metrics or {})
+
+    entry_dt = _parse_iso_datetime(trade.entry_time)
+    exit_dt = _parse_iso_datetime(trade.exit_time)
+
+    if not trade.date:
+        trade.date = trade.exit_time or trade.entry_time or ""
+
+    if metrics.get("hold_time_minutes") is None and entry_dt and exit_dt:
+        metrics["hold_time_minutes"] = int((exit_dt - entry_dt).total_seconds() / 60)
+
+    fees = metrics.get("fees_usd")
+    if metrics.get("net_profit_after_fees") is None:
+        if trade.pnl is not None:
+            metrics["net_profit_after_fees"] = trade.pnl - fees if isinstance(fees, (int, float)) else trade.pnl
+        else:
+            metrics["net_profit_after_fees"] = None
+
+    if metrics.get("win_flag") is None:
+        metrics["win_flag"] = None if trade.pnl is None else trade.pnl > 0
+
+    if metrics.get("loss_flag") is None:
+        metrics["loss_flag"] = None if trade.pnl is None else trade.pnl < 0
+
+    if not metrics.get("weekday") and trade.date:
+        date_dt = _parse_iso_datetime(trade.date)
+        if date_dt:
+            metrics["weekday"] = date_dt.strftime("%A")
+
+    if trade.risk_reward is None and isinstance(metrics.get("realized_r_multiple"), (int, float)):
+        trade.risk_reward = float(metrics["realized_r_multiple"])
+
+    if trade.risk_per_trade_r is None and isinstance(metrics.get("planned_r_multiple"), (int, float)):
+        trade.risk_per_trade_r = float(metrics["planned_r_multiple"])
+
+    trade.metrics = metrics
+    return trade
+
+
+def _maybe_parse_json_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{":
+        return value
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return value
+
+
 def _normalize_request_body(body: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
     """
-    Accept multiple body shapes to survive wrapper quirks from Actions:
+    Accept multiple body shapes to survive wrapper quirks from Actions.
+    Supported examples:
     1) {"api_key": "...", "trade": {...}}
-    2) {"api_key": "...", "payload": {"trade": {...}}}
-    3) {"api_key": "...", "data": {"trade": {...}}}
-    4) {"api_key": "...", <trade fields at root>}
-    5) {"trade": {...}}  -> api_key absent => handled later
+    2) {"payload": {"api_key": "...", "trade": {...}}}
+    3) {"data": {"api_key": "...", "trade": {...}}}
+    4) {"input": {"api_key": "...", "trade": {...}}}
+    5) {"kwargs": {"api_key": "...", "trade": {...}}}
+    6) {"api_key": "...", <trade fields at root>}
     """
+    body = _maybe_parse_json_string(body)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must resolve to a JSON object.")
+
+    for wrapper_key in ("payload", "data", "input", "kwargs"):
+        wrapped = _maybe_parse_json_string(body.get(wrapper_key))
+        if isinstance(wrapped, dict):
+            body = {**wrapped, **{k: v for k, v in body.items() if k not in {wrapper_key}}}
+            break
+
     api_key = body.get("api_key")
+    trade_candidate = _maybe_parse_json_string(body.get("trade"))
+    if isinstance(trade_candidate, dict):
+        return api_key, trade_candidate
 
-    if isinstance(body.get("trade"), dict):
-        return api_key, body["trade"]
-
-    payload = body.get("payload")
-    if isinstance(payload, dict):
-        if isinstance(payload.get("trade"), dict):
-            return api_key or payload.get("api_key"), payload["trade"]
-        return api_key or payload.get("api_key"), payload
-
-    data = body.get("data")
-    if isinstance(data, dict):
-        if isinstance(data.get("trade"), dict):
-            return api_key or data.get("api_key"), data["trade"]
-        return api_key or data.get("api_key"), data
-
-    # Treat the root object itself as trade payload, excluding transport keys
     root_trade = {
-        k: v for k, v in body.items()
-        if k not in {"api_key", "trade", "payload", "data"}
+        k: _maybe_parse_json_string(v)
+        for k, v in body.items()
+        if k not in {"api_key", "trade", "payload", "data", "input", "kwargs"}
     }
     return api_key, root_trade
 
@@ -215,11 +304,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/create-export")
+@app.post("/create-export", response_model=CreateExportResponse)
 async def create_export(request: Request):
-    body = await request.json()
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}") from exc
 
     api_key, trade_raw = _normalize_request_body(body)
     _require_api_key(api_key)
@@ -229,6 +319,7 @@ async def create_export(request: Request):
     except ValidationError as e:
         raise HTTPException(status_code=422, detail={"message": "Invalid trade payload.", "errors": e.errors()})
 
+    trade = _ensure_derived_fields(trade)
     dbx = _require_dropbox_client()
 
     trade_id = trade.trade_id.strip()
@@ -238,8 +329,11 @@ async def create_export(request: Request):
     json_bytes = build_json_bytes(trade)
     pdf_bytes = build_pdf_bytes(trade)
 
-    json_info = upload_to_dropbox(dbx, f"{DROPBOX_ROOT}/json", f"{trade_id}.json", json_bytes)
-    pdf_info = upload_to_dropbox(dbx, f"{DROPBOX_ROOT}/pdf", f"{trade_id}.pdf", pdf_bytes)
+    try:
+        json_info = upload_to_dropbox(dbx, f"{DROPBOX_ROOT}/json", f"{trade_id}.json", json_bytes)
+        pdf_info = upload_to_dropbox(dbx, f"{DROPBOX_ROOT}/pdf", f"{trade_id}.pdf", pdf_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Dropbox upload failed: {exc}") from exc
 
     return JSONResponse(
         {
