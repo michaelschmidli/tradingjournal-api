@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: 91 Tradingjournal Export API
-  version: 1.0.0
+  version: 1.1.0
 servers:
   - url: https://tradingjournal-api.onrender.com
 paths:
@@ -22,10 +22,7 @@ paths:
           application/json:
             schema:
               type: object
-              additionalProperties: false
-              required:
-                - api_key
-                - trade
+              additionalProperties: true
               properties:
                 api_key:
                   type: string
