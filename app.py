@@ -3,17 +3,16 @@ from __future__ import annotations
 import io
 import json
 import os
-from datetime import datetime
+import textwrap
 from typing import Any, Dict, Optional
 
 import dropbox
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-
 
 load_dotenv()
 
@@ -22,7 +21,7 @@ DROPBOX_ROOT = os.getenv("DROPBOX_ROOT", "/91 Tradingjournal")
 API_KEY = os.getenv("API_KEY", "")
 DROPBOX_ACCESS_TOKEN = os.getenv("DROPBOX_ACCESS_TOKEN", "")
 
-app = FastAPI(title=APP_TITLE, version="1.0.0")
+app = FastAPI(title=APP_TITLE, version="1.1.0")
 
 
 class TradePayload(BaseModel):
@@ -42,18 +41,14 @@ class TradePayload(BaseModel):
     notes: Optional[str] = None
     journal: Dict[str, Any] = Field(default_factory=dict)
     metrics: Dict[str, Any] = Field(default_factory=dict)
+    bot_assessment: Dict[str, Any] = Field(default_factory=dict)
     attachments: Dict[str, Any] = Field(default_factory=dict)
 
 
-class ExportRequest(BaseModel):
-    api_key: str
-    trade: TradePayload
-
-
-def _require_api_key(given: str) -> None:
+def _require_api_key(given: Optional[str]) -> None:
     if not API_KEY:
         raise HTTPException(status_code=500, detail="API_KEY is not configured on the server.")
-    if given != API_KEY:
+    if not given or given != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
@@ -71,6 +66,40 @@ def _as_text(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         return ", ".join(str(x) for x in value) if value else "-"
     return str(value)
+
+
+def _normalize_request_body(body: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
+    """
+    Accept multiple body shapes to survive wrapper quirks from Actions:
+    1) {"api_key": "...", "trade": {...}}
+    2) {"api_key": "...", "payload": {"trade": {...}}}
+    3) {"api_key": "...", "data": {"trade": {...}}}
+    4) {"api_key": "...", <trade fields at root>}
+    5) {"trade": {...}}  -> api_key absent => handled later
+    """
+    api_key = body.get("api_key")
+
+    if isinstance(body.get("trade"), dict):
+        return api_key, body["trade"]
+
+    payload = body.get("payload")
+    if isinstance(payload, dict):
+        if isinstance(payload.get("trade"), dict):
+            return api_key or payload.get("api_key"), payload["trade"]
+        return api_key or payload.get("api_key"), payload
+
+    data = body.get("data")
+    if isinstance(data, dict):
+        if isinstance(data.get("trade"), dict):
+            return api_key or data.get("api_key"), data["trade"]
+        return api_key or data.get("api_key"), data
+
+    # Treat the root object itself as trade payload, excluding transport keys
+    root_trade = {
+        k: v for k, v in body.items()
+        if k not in {"api_key", "trade", "payload", "data"}
+    }
+    return api_key, root_trade
 
 
 def build_json_bytes(trade: TradePayload) -> bytes:
@@ -128,15 +157,28 @@ def build_pdf_bytes(trade: TradePayload) -> bytes:
 
     y -= 8
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(left_x, y, "Weitere Notizen")
+    c.drawString(left_x, y, "Bewertung")
     y -= 20
     c.setFont("Helvetica", 10)
-    notes = _as_text(trade.notes)
-    for chunk in textwrap.wrap(notes, width=85) if notes != "-" else ["-"]:
-        c.drawString(left_x, y, chunk)
-        y -= line_gap
+    line("Nutzerbewertung", trade.journal.get("setup_rating"))
+    line("Bot-Bewertung", trade.bot_assessment.get("rating"))
 
-    # right-side quick stats
+    y -= 8
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(left_x, y, "Live Coaching")
+    y -= 20
+    c.setFont("Helvetica", 10)
+    coaching_lines = [
+        f"Kurzfazit: {_as_text(trade.bot_assessment.get('summary'))}",
+        f"Staerken: {_as_text(trade.bot_assessment.get('strengths'))}",
+        f"Schwaechen: {_as_text(trade.bot_assessment.get('weaknesses'))}",
+        f"Coaching: {_as_text(trade.bot_assessment.get('live_coaching'))}",
+    ]
+    for raw in coaching_lines:
+        for chunk in textwrap.wrap(raw, width=85):
+            c.drawString(left_x, y, chunk)
+            y -= line_gap
+
     y2 = height - 68
     c.setFont("Helvetica-Bold", 11)
     c.drawString(right_x, y2, "Kennzahlen")
@@ -174,11 +216,21 @@ def health() -> dict[str, str]:
 
 
 @app.post("/create-export")
-def create_export(request: ExportRequest):
-    _require_api_key(request.api_key)
+async def create_export(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object.")
+
+    api_key, trade_raw = _normalize_request_body(body)
+    _require_api_key(api_key)
+
+    try:
+        trade = TradePayload.model_validate(trade_raw)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail={"message": "Invalid trade payload.", "errors": e.errors()})
+
     dbx = _require_dropbox_client()
 
-    trade = request.trade
     trade_id = trade.trade_id.strip()
     if not trade_id:
         raise HTTPException(status_code=400, detail="trade_id is required.")
