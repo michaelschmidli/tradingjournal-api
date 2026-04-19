@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: 91 Tradingjournal Export API
-  version: 1.1.0
+  version: 1.2.0
 servers:
   - url: https://tradingjournal-api.onrender.com
 paths:
@@ -12,6 +12,14 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                required: [status]
   /create-export:
     post:
       operationId: createExport
@@ -21,42 +29,111 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              additionalProperties: true
-              properties:
-                api_key:
-                  type: string
-                  description: Geheimer API-Key für das Backend
-                trade:
-                  type: object
-                  description: Vollständiges Trade-Objekt im Unified-Format
-                  additionalProperties: true
+              $ref: '#/components/schemas/CreateExportRequest'
       responses:
         '200':
           description: Export erfolgreich
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: false
-                properties:
-                  success:
-                    type: boolean
-                  trade_id:
-                    type: string
-                  json_file:
-                    type: object
-                    additionalProperties: false
-                    properties:
-                      path:
-                        type: string
-                      url:
-                        type: string
-                  pdf_file:
-                    type: object
-                    additionalProperties: false
-                    properties:
-                      path:
-                        type: string
-                      url:
-                        type: string
+                $ref: '#/components/schemas/CreateExportResponse'
+        '400':
+          description: Ungültiger Request
+        '401':
+          description: API-Key ungültig
+        '422':
+          description: Trade-Payload ungültig
+        '500':
+          description: Server- oder Dropbox-Fehler
+components:
+  schemas:
+    CreateExportRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - api_key
+        - trade
+      properties:
+        api_key:
+          type: string
+          description: Geheimer API-Key für das Backend
+        trade:
+          $ref: '#/components/schemas/TradePayload'
+    TradePayload:
+      type: object
+      additionalProperties: false
+      required:
+        - trade_id
+      properties:
+        trade_id:
+          type: string
+        date:
+          type: string
+        asset:
+          type: string
+        side:
+          type: string
+          enum: [Long, Short, '']
+        setup:
+          type: string
+          enum: [First NY Candle, FVG, 'PDH / PDL', 'PMH / PML', Advanced, '']
+        session:
+          type: string
+          enum: [Asia, London, New York, '']
+        entry_price:
+          type: number
+          nullable: true
+        exit_price:
+          type: number
+          nullable: true
+        entry_time:
+          type: string
+        exit_time:
+          type: string
+        pnl:
+          type: number
+          nullable: true
+        risk_reward:
+          type: number
+          nullable: true
+        risk_per_trade_r:
+          type: number
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        journal:
+          type: object
+          additionalProperties: true
+        metrics:
+          type: object
+          additionalProperties: true
+        bot_assessment:
+          type: object
+          additionalProperties: true
+        attachments:
+          type: object
+          additionalProperties: true
+    FileInfo:
+      type: object
+      additionalProperties: false
+      required: [path, url]
+      properties:
+        path:
+          type: string
+        url:
+          type: string
+          format: uri
+    CreateExportResponse:
+      type: object
+      additionalProperties: false
+      required: [success, trade_id, json_file, pdf_file]
+      properties:
+        success:
+          type: boolean
+        trade_id:
+          type: string
+        json_file:
+          $ref: '#/components/schemas/FileInfo'
+        pdf_file:
+          $ref: '#/components/schemas/FileInfo'
