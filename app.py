@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
 import textwrap
+from datetime import datetime
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 import dropbox
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 load_dotenv()
@@ -24,7 +30,7 @@ DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "") or os.getenv("DROPBOX_CLIENT_ID", "")
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "") or os.getenv("DROPBOX_CLIENT_SECRET", "")
 
-app = FastAPI(title=APP_TITLE, version="1.3.0")
+app = FastAPI(title=APP_TITLE, version="1.4.0")
 
 
 class TradePayload(BaseModel):
@@ -56,10 +62,6 @@ def _require_api_key(given: Optional[str]) -> None:
 
 
 def _build_dropbox_client() -> dropbox.Dropbox:
-    """
-    Prefer refresh-token auth so Dropbox can rotate short-lived access tokens automatically.
-    Fallback to a static access token for backward compatibility.
-    """
     if DROPBOX_REFRESH_TOKEN:
         if not DROPBOX_APP_KEY or not DROPBOX_APP_SECRET:
             raise HTTPException(
@@ -91,7 +93,6 @@ def _build_dropbox_client() -> dropbox.Dropbox:
 def _require_dropbox_client() -> dropbox.Dropbox:
     try:
         dbx = _build_dropbox_client()
-        # Early auth check so token problems fail with a clear message before upload starts.
         dbx.users_get_current_account()
         return dbx
     except dropbox.exceptions.AuthError as e:
@@ -108,27 +109,7 @@ def _require_dropbox_client() -> dropbox.Dropbox:
         )
 
 
-def _as_text(value: Any) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    if isinstance(value, (list, tuple)):
-        return ", ".join(str(x) for x in value) if value else "-"
-    return str(value)
-
-
 def _normalize_request_body(body: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
-    """
-    Accept multiple body shapes to survive wrapper quirks from Actions:
-    1) {"api_key": "...", "trade": {...}}
-    2) {"api_key": "...", "payload": {"trade": {...}}}
-    3) {"api_key": "...", "data": {"trade": {...}}}
-    4) {"api_key": "...", "input": {"trade": {...}}}
-    5) {"api_key": "...", "kwargs": {"trade": {...}}}
-    6) {"api_key": "...", <trade fields at root>}
-    7) {"trade": {...}}  -> api_key absent => handled later
-    """
     api_key = body.get("api_key")
 
     if isinstance(body.get("trade"), dict):
@@ -148,8 +129,235 @@ def _normalize_request_body(body: Dict[str, Any]) -> tuple[Optional[str], Dict[s
     return api_key, root_trade
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value or not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    try:
+        return datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_datetime(value: Any) -> str:
+    dt = _parse_iso_datetime(value)
+    if not dt:
+        return "-"
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def _format_number(value: Any, decimals: int = 2, suffix: str = "") -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, bool):
+        return "Ja" if value else "Nein"
+    num = _safe_float(value)
+    if num is None:
+        return str(value)
+    return f"{num:.{decimals}f}{suffix}"
+
+
+def _format_list(value: Any) -> str:
+    if not value:
+        return "-"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(x) for x in value if x not in (None, "")) or "-"
+    return str(value)
+
+
+def _format_hold_time(minutes: Any) -> str:
+    total = _safe_float(minutes)
+    if total is None:
+        return "-"
+    total_minutes = int(round(total))
+    if total_minutes < 60:
+        return f"{total_minutes} Minuten"
+    hours = total_minutes // 60
+    rest = total_minutes % 60
+    if rest == 0:
+        return f"{hours} Std"
+    return f"{hours} Std {rest} Min"
+
+
+def _as_text(value: Any) -> str:
+    if value is None or value == "":
+        return "-"
+    if isinstance(value, bool):
+        return "Ja" if value else "Nein"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(x) for x in value) if value else "-"
+    return str(value)
+
+
+def _calc_hold_time_minutes(entry_time: str, exit_time: str) -> Optional[int]:
+    entry_dt = _parse_iso_datetime(entry_time)
+    exit_dt = _parse_iso_datetime(exit_time)
+    if not entry_dt or not exit_dt:
+        return None
+    delta = int(round((exit_dt - entry_dt).total_seconds() / 60))
+    return max(delta, 0)
+
+
+def _calc_weekday(value: str) -> str:
+    dt = _parse_iso_datetime(value)
+    return dt.strftime("%A") if dt else ""
+
+
+def _generate_bot_assessment(trade: TradePayload) -> Dict[str, Any]:
+    existing = trade.bot_assessment or {}
+    has_meaningful_existing = any(existing.get(key) not in (None, "", [], {}) for key in (
+        "rating", "summary", "strengths", "weaknesses", "live_coaching"
+    ))
+    if has_meaningful_existing:
+        return existing
+
+    pnl = _safe_float(trade.pnl) or 0.0
+    rules_followed = trade.journal.get("rules_followed")
+    setup_rating = str(trade.journal.get("setup_rating") or "").strip().upper()
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+
+    if rules_followed is True:
+        strengths.append("Regeln eingehalten")
+    elif rules_followed is False:
+        weaknesses.append("Regelverstoß dokumentiert")
+
+    if pnl > 0:
+        strengths.append("Trade im Gewinn geschlossen")
+    elif pnl < 0:
+        weaknesses.append("Trade im Verlust geschlossen")
+
+    if setup_rating in {"A", "B"}:
+        strengths.append(f"Nutzerbewertung {setup_rating}")
+    elif setup_rating in {"C", "D"}:
+        weaknesses.append(f"Nutzerbewertung {setup_rating}")
+
+    if trade.journal.get("confluence_factors"):
+        strengths.append("Konfluenz vorhanden")
+
+    if not strengths:
+        strengths.append("Trade sauber dokumentiert")
+    if not weaknesses:
+        weaknesses.append("Feinabstimmung bei Timing und Management prüfen")
+
+    if pnl > 0 and rules_followed is True:
+        rating = "A"
+        summary = "Sauberer Trade mit guter Umsetzung."
+        coaching = "Behalte diese Disziplin bei und dokumentiere weiter konsequent deine Konfluenz."
+    elif pnl >= 0:
+        rating = "B"
+        summary = "Insgesamt solide Ausführung mit kleinen Verbesserungspunkten."
+        coaching = "Achte weiter auf präzise Entries und halte dein Management konstant."
+    elif rules_followed is False:
+        rating = "D"
+        summary = "Der Trade hatte klare Schwächen in der Ausführung oder Regeltreue."
+        coaching = "Arbeite vor allem an Regelkonformität und warte auf sauberere Bestätigungen vor dem Entry."
+    else:
+        rating = "C"
+        summary = "Verbesserungsfähiger Trade mit erkennbaren Lernpunkten."
+        coaching = "Nimm dir vor dem nächsten Entry etwas mehr Geduld für Bestätigung und Timing."
+
+    return {
+        "rating": rating,
+        "summary": summary,
+        "strengths": strengths[:3],
+        "weaknesses": weaknesses[:3],
+        "live_coaching": coaching,
+    }
+
+
+def _enrich_trade(trade: TradePayload) -> TradePayload:
+    trade.journal = dict(trade.journal or {})
+    trade.metrics = dict(trade.metrics or {})
+    trade.bot_assessment = dict(trade.bot_assessment or {})
+    trade.attachments = dict(trade.attachments or {})
+
+    if not trade.date:
+        trade.date = trade.exit_time or trade.entry_time or ""
+
+    hold_time_minutes = trade.metrics.get("hold_time_minutes")
+    if hold_time_minutes in (None, ""):
+        trade.metrics["hold_time_minutes"] = _calc_hold_time_minutes(trade.entry_time, trade.exit_time)
+
+    if trade.metrics.get("net_profit_after_fees") in (None, ""):
+        pnl = _safe_float(trade.pnl)
+        fees = _safe_float(trade.metrics.get("fees_usd"))
+        if pnl is not None:
+            trade.metrics["net_profit_after_fees"] = pnl - fees if fees is not None else pnl
+
+    if trade.metrics.get("win_flag") in (None, ""):
+        trade.metrics["win_flag"] = None if trade.pnl is None else (_safe_float(trade.pnl) or 0) > 0
+
+    if trade.metrics.get("loss_flag") in (None, ""):
+        trade.metrics["loss_flag"] = None if trade.pnl is None else (_safe_float(trade.pnl) or 0) < 0
+
+    if trade.metrics.get("weekday") in (None, "") and trade.date:
+        trade.metrics["weekday"] = _calc_weekday(trade.date)
+
+    if trade.risk_reward in (None, ""):
+        realized = _safe_float(trade.metrics.get("realized_r_multiple"))
+        if realized is not None:
+            trade.risk_reward = round(realized, 2)
+        else:
+            entry = _safe_float(trade.entry_price)
+            exit_price = _safe_float(trade.exit_price)
+            stop_loss = _safe_float(trade.journal.get("stop_loss"))
+            if entry is not None and exit_price is not None and stop_loss is not None:
+                risk = abs(entry - stop_loss)
+                reward = abs(exit_price - entry)
+                if risk > 0:
+                    trade.risk_reward = round(reward / risk, 2)
+
+    if trade.risk_per_trade_r in (None, ""):
+        planned = _safe_float(trade.metrics.get("planned_r_multiple"))
+        if planned is not None:
+            trade.risk_per_trade_r = round(planned, 2)
+
+    trade.bot_assessment = _generate_bot_assessment(trade)
+    return trade
+
+
 def build_json_bytes(trade: TradePayload) -> bytes:
     return json.dumps(trade.model_dump(), ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _load_chart_image(chart_reference: Optional[str]) -> Optional[ImageReader]:
+    if not chart_reference:
+        return None
+
+    ref = str(chart_reference).strip()
+    if not ref:
+        return None
+
+    try:
+        if ref.startswith("data:image") and "," in ref:
+            _, encoded = ref.split(",", 1)
+            return ImageReader(io.BytesIO(base64.b64decode(encoded)))
+
+        parsed = urlparse(ref)
+        if parsed.scheme in {"http", "https"}:
+            with urlopen(ref, timeout=10) as response:
+                return ImageReader(io.BytesIO(response.read()))
+
+        if os.path.exists(ref):
+            return ImageReader(ref)
+    except Exception:
+        return None
+
+    return None
 
 
 def build_pdf_bytes(trade: TradePayload) -> bytes:
@@ -157,91 +365,144 @@ def build_pdf_bytes(trade: TradePayload) -> bytes:
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
-    y = height - 40
-    left_x = 50
-    right_x = 320
-    line_gap = 16
+    left_margin = 56
+    right_margin = width - 56
+    top_y = height - 48
+    left_col_x = 56
+    left_val_x = 170
+    right_col_x = 330
+    right_val_x = 430
 
-    def line(label: str, value: Any, x: int = left_x) -> None:
-        nonlocal y
-        c.drawString(x, y, f"{label}: {_as_text(value)}")
-        y -= line_gap
+    def draw_pair(label_x: float, value_x: float, y: float, label: str, value: str) -> float:
+        c.setFont("Helvetica-Bold", 10)
+        c.setFillColor(colors.black)
+        c.drawString(label_x, y, label)
+        c.setFont("Helvetica", 10)
+        c.drawString(value_x, y, value)
+        return y - 16
+
+    def draw_wrapped_block(title: str, items: list[tuple[str, str]], y: float) -> float:
+        c.setFont("Helvetica-Bold", 11)
+        c.setFillColor(colors.black)
+        c.drawString(left_col_x, y, title)
+        y -= 18
+        for label, value in items:
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(left_col_x, y, label)
+            y -= 12
+            c.setFont("Helvetica", 10)
+            wrapped = textwrap.wrap(value or "-", width=88) or ["-"]
+            for chunk in wrapped:
+                c.drawString(left_val_x, y, chunk)
+                y -= 12
+            y -= 4
+        return y - 8
+
+    def draw_chart(y_bottom: float) -> None:
+        chart = _load_chart_image(trade.attachments.get("chart_screenshot"))
+        c.setFont("Helvetica-Bold", 11)
+        c.setFillColor(colors.black)
+        c.drawString(left_col_x, y_bottom + 212, "Chart")
+        c.setStrokeColor(colors.HexColor("#C9CDD3"))
+        c.rect(left_col_x, y_bottom, 450, 200, stroke=1, fill=0)
+        if chart is not None:
+            try:
+                c.drawImage(chart, left_col_x, y_bottom, width=450, height=200, preserveAspectRatio=True, anchor='c')
+            except Exception:
+                c.setFont("Helvetica", 10)
+                c.drawString(left_col_x + 12, y_bottom + 95, "Chart konnte nicht geladen werden.")
+        else:
+            c.setFont("Helvetica", 10)
+            c.drawString(left_col_x + 12, y_bottom + 95, "Kein Chart-Screenshot vorhanden oder abrufbar.")
+
+    c.setTitle(f"Trade {trade.trade_id}")
 
     c.setFont("Helvetica-Bold", 14)
-    c.drawString(left_x, y, f"Trade {trade.trade_id}")
-    y -= 28
+    c.setFillColor(colors.black)
+    c.drawString(left_margin, top_y, f"Trade {trade.trade_id}")
+    top_y -= 28
 
-    c.setFont("Helvetica", 10)
-    line("Datum", trade.date)
-    line("Asset", trade.asset)
-    line("Richtung", trade.side)
-    line("Setup", trade.setup)
-    line("Session", trade.session)
-    line("Entry Preis", trade.entry_price)
-    line("Exit Preis", trade.exit_price)
-    line("PnL", trade.pnl)
-    line("R-Multiple", trade.risk_reward)
-    line("Hold Time", trade.metrics.get("hold_time_minutes"))
+    c.setStrokeColor(colors.HexColor("#DADDE3"))
+    c.line(left_margin, top_y, right_margin, top_y)
+    top_y -= 20
 
-    y -= 8
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(left_x, y, "Psychologie")
-    y -= 20
-    c.setFont("Helvetica", 10)
-    line("Vor dem Trade", trade.journal.get("emotion_before"))
-    line("Während des Trades", trade.journal.get("emotion_during"))
-    line("Nach dem Exit", trade.journal.get("emotion_after"))
+    leverage_value = trade.metrics.get("leverage") or trade.journal.get("leverage") or trade.attachments.get("leverage") or "-"
+    hold_value = _format_hold_time(trade.metrics.get("hold_time_minutes"))
+    pnl_value = _safe_float(trade.pnl)
 
-    y -= 8
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(left_x, y, "Lessons Learned")
-    y -= 20
-    c.setFont("Helvetica", 10)
-    line("Gut", trade.journal.get("lessons_good"))
-    line("Schlecht", trade.journal.get("lessons_bad"))
-    line("Nächstes Mal", trade.journal.get("lessons_next_time"))
+    left_y = top_y
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Datum", _format_datetime(trade.date))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Asset", _as_text(trade.asset))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Richtung", _as_text(trade.side))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Setup", _as_text(trade.setup))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Session", _as_text(trade.session))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Leverage", _as_text(leverage_value))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Entry Zeit", _format_datetime(trade.entry_time))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Exit Zeit", _format_datetime(trade.exit_time))
+    left_y = draw_pair(left_col_x, left_val_x, left_y, "Hold Time", hold_value)
 
-    y -= 8
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(left_x, y, "Bewertung")
-    y -= 20
-    c.setFont("Helvetica", 10)
-    line("Nutzerbewertung", trade.journal.get("setup_rating"))
-    line("Bot-Bewertung", trade.bot_assessment.get("rating"))
+    right_y = top_y
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "Entry", _format_number(trade.entry_price))
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "Exit", _format_number(trade.exit_price))
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "Stop Loss", _format_number(trade.journal.get("stop_loss")))
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "Take Profit", _format_number(trade.journal.get("take_profit")))
 
-    y -= 8
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(left_x, y, "Live Coaching")
-    y -= 20
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(right_col_x, right_y, "PnL")
     c.setFont("Helvetica", 10)
-    coaching_lines = [
-        f"Kurzfazit: {_as_text(trade.bot_assessment.get('summary'))}",
-        f"Staerken: {_as_text(trade.bot_assessment.get('strengths'))}",
-        f"Schwaechen: {_as_text(trade.bot_assessment.get('weaknesses'))}",
-        f"Coaching: {_as_text(trade.bot_assessment.get('live_coaching'))}",
-    ]
-    for raw in coaching_lines:
-        for chunk in textwrap.wrap(raw, width=85):
-            c.drawString(left_x, y, chunk)
-            y -= line_gap
+    c.setFillColor(colors.HexColor("#15803D") if (pnl_value is not None and pnl_value > 0) else colors.HexColor("#B91C1C") if (pnl_value is not None and pnl_value < 0) else colors.black)
+    c.drawString(right_val_x, right_y, _format_number(trade.pnl))
+    c.setFillColor(colors.black)
+    right_y -= 16
 
-    y2 = height - 68
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(right_x, y2, "Kennzahlen")
-    y2 -= 18
-    c.setFont("Helvetica", 10)
-    stats = [
-        ("ROI", trade.metrics.get("roi_percent")),
-        ("Netto nach Fees", trade.metrics.get("net_profit_after_fees")),
-        ("Win Flag", trade.metrics.get("win_flag")),
-        ("Loss Flag", trade.metrics.get("loss_flag")),
-        ("Weekday", trade.metrics.get("weekday")),
-        ("MFE", trade.metrics.get("mfe")),
-        ("MAE", trade.metrics.get("mae")),
-    ]
-    for label, value in stats:
-        c.drawString(right_x, y2, f"{label}: {_as_text(value)}")
-        y2 -= line_gap
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "ROI", _format_number(trade.metrics.get("roi_percent"), suffix="%"))
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "R-Multiple", _format_number(trade.risk_reward))
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "Netto nach Fees", _format_number(trade.metrics.get("net_profit_after_fees")))
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "Nutzerbewertung", _as_text(trade.journal.get("setup_rating")))
+    right_y = draw_pair(right_col_x, right_val_x, right_y, "Bot-Bewertung", _as_text(trade.bot_assessment.get("rating")))
+
+    content_y = min(left_y, right_y) - 20
+    content_y = draw_wrapped_block(
+        "Psychologie",
+        [
+            ("Vor dem Trade", _as_text(trade.journal.get("emotion_before"))),
+            ("Während des Trades", _as_text(trade.journal.get("emotion_during"))),
+            ("Nach dem Exit", _as_text(trade.journal.get("emotion_after"))),
+        ],
+        content_y,
+    )
+
+    content_y = draw_wrapped_block(
+        "Lessons Learned",
+        [
+            ("Gut", _as_text(trade.journal.get("lessons_good"))),
+            ("Schlecht", _as_text(trade.journal.get("lessons_bad"))),
+            ("Nächstes Mal", _as_text(trade.journal.get("lessons_next_time"))),
+        ],
+        content_y,
+    )
+
+    content_y = draw_wrapped_block(
+        "Live Coaching",
+        [
+            ("Kurzfazit", _as_text(trade.bot_assessment.get("summary"))),
+            ("Stärken", _format_list(trade.bot_assessment.get("strengths"))),
+            ("Schwächen", _format_list(trade.bot_assessment.get("weaknesses"))),
+            ("Coaching", _as_text(trade.bot_assessment.get("live_coaching"))),
+        ],
+        content_y,
+    )
+
+    notes_text = _as_text(trade.notes)
+    content_y = draw_wrapped_block("Weitere Notizen", [("Notizen", notes_text)], content_y)
+
+    chart_bottom = 40
+    min_gap_to_chart = 220
+    if content_y > chart_bottom + min_gap_to_chart:
+        draw_chart(chart_bottom)
+    else:
+        c.showPage()
+        draw_chart(height - 260)
 
     c.save()
     pdf = buffer.getvalue()
@@ -280,6 +541,8 @@ async def create_export(request: Request):
     trade_id = trade.trade_id.strip()
     if not trade_id:
         raise HTTPException(status_code=400, detail="trade_id is required.")
+
+    trade = _enrich_trade(trade)
 
     json_bytes = build_json_bytes(trade)
     pdf_bytes = build_pdf_bytes(trade)
