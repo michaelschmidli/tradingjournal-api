@@ -76,8 +76,10 @@ def _build_dropbox_client() -> dropbox.Dropbox:
             app_key=DROPBOX_APP_KEY,
             app_secret=DROPBOX_APP_SECRET,
         )
+
     if DROPBOX_ACCESS_TOKEN:
         return dropbox.Dropbox(DROPBOX_ACCESS_TOKEN)
+
     raise HTTPException(
         status_code=500,
         detail=(
@@ -109,14 +111,17 @@ def _require_dropbox_client() -> dropbox.Dropbox:
 
 def _normalize_request_body(body: Dict[str, Any]) -> tuple[Optional[str], Dict[str, Any]]:
     api_key = body.get("api_key")
+
     if isinstance(body.get("trade"), dict):
         return api_key, body["trade"]
+
     for wrapper_key in ("payload", "data", "input", "kwargs"):
         wrapper = body.get(wrapper_key)
         if isinstance(wrapper, dict):
             if isinstance(wrapper.get("trade"), dict):
                 return api_key or wrapper.get("api_key"), wrapper["trade"]
             return api_key or wrapper.get("api_key"), wrapper
+
     root_trade = {
         k: v for k, v in body.items()
         if k not in {"api_key", "trade", "payload", "data", "input", "kwargs"}
@@ -145,39 +150,7 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return None
 
 
-WEEKDAYS_DE = {
-    0: "Montag",
-    1: "Dienstag",
-    2: "Mittwoch",
-    3: "Donnerstag",
-    4: "Freitag",
-    5: "Samstag",
-    6: "Sonntag",
-}
-MONTHS_DE = {
-    1: "Januar",
-    2: "Februar",
-    3: "März",
-    4: "April",
-    5: "Mai",
-    6: "Juni",
-    7: "Juli",
-    8: "August",
-    9: "September",
-    10: "Oktober",
-    11: "November",
-    12: "Dezember",
-}
-
-
-def _format_datetime_long(value: Any) -> str:
-    dt = _parse_iso_datetime(value)
-    if not dt:
-        return "-"
-    return f"{WEEKDAYS_DE[dt.weekday()]}, {dt.day:02d}. {MONTHS_DE[dt.month]} {dt.year} {dt:%H:%M}"
-
-
-def _format_datetime_short(value: Any) -> str:
+def _format_datetime(value: Any) -> str:
     dt = _parse_iso_datetime(value)
     if not dt:
         return "-"
@@ -187,25 +160,19 @@ def _format_datetime_short(value: Any) -> str:
 def _format_number(value: Any, decimals: int = 2, suffix: str = "") -> str:
     if value is None or value == "":
         return "-"
+    if isinstance(value, bool):
+        return "Ja" if value else "Nein"
     num = _safe_float(value)
     if num is None:
         return str(value)
-    formatted = f"{num:,.{decimals}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"{formatted}{suffix}"
-
-
-def _format_currency(value: Any, suffix: str = " $") -> str:
-    if value is None or value == "":
-        return "-"
-    return _format_number(value, 2, suffix)
+    return f"{num:.{decimals}f}{suffix}"
 
 
 def _format_list(value: Any) -> str:
     if not value:
         return "-"
     if isinstance(value, (list, tuple)):
-        vals = [str(x) for x in value if x not in (None, "")]
-        return " • ".join(vals) if vals else "-"
+        return ", ".join(str(x) for x in value if x not in (None, "")) or "-"
     return str(value)
 
 
@@ -214,18 +181,13 @@ def _format_hold_time(minutes: Any) -> str:
     if total is None:
         return "-"
     total_minutes = int(round(total))
-    days = total_minutes // (24 * 60)
-    remainder = total_minutes % (24 * 60)
-    hours = remainder // 60
-    mins = remainder % 60
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days} Tag" if days == 1 else f"{days} Tage")
-    if hours:
-        parts.append(f"{hours} Std")
-    if mins or not parts:
-        parts.append(f"{mins} Min")
-    return " ".join(parts)
+    if total_minutes < 60:
+        return f"{total_minutes} Minuten"
+    hours = total_minutes // 60
+    rest = total_minutes % 60
+    if rest == 0:
+        return f"{hours} Std"
+    return f"{hours} Std {rest} Min"
 
 
 def _as_text(value: Any) -> str:
@@ -234,9 +196,9 @@ def _as_text(value: Any) -> str:
     if isinstance(value, bool):
         return "Ja" if value else "Nein"
     if isinstance(value, float):
-        return _format_number(value)
+        return f"{value:.2f}"
     if isinstance(value, (list, tuple)):
-        return ", ".join(str(x) for x in value if x not in (None, "")) or "-"
+        return ", ".join(str(x) for x in value) if value else "-"
     return str(value)
 
 
@@ -375,21 +337,26 @@ def build_json_bytes(trade: TradePayload) -> bytes:
 def _load_chart_image(chart_reference: Optional[str]) -> Optional[ImageReader]:
     if not chart_reference:
         return None
+
     ref = str(chart_reference).strip()
     if not ref:
         return None
+
     try:
         if ref.startswith("data:image") and "," in ref:
             _, encoded = ref.split(",", 1)
             return ImageReader(io.BytesIO(base64.b64decode(encoded)))
+
         parsed = urlparse(ref)
         if parsed.scheme in {"http", "https"}:
             with urlopen(ref, timeout=10) as response:
                 return ImageReader(io.BytesIO(response.read()))
+
         if os.path.exists(ref):
             return ImageReader(ref)
     except Exception:
         return None
+
     return None
 
 
@@ -398,194 +365,219 @@ def build_pdf_bytes(trade: TradePayload) -> bytes:
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
 
-    # Layout constants based on requested minimal design
-    left_margin = 85
-    right_margin = 56
-    top_margin = 71
-    bottom_margin = 56
-    col_gap = 57
-    col_width = 198
+    # Layout according to the minimalist specification.
+    top_margin = 71   # ~2.5 cm
+    bottom_margin = 57  # ~2.0 cm
+    left_margin = 85  # ~3.0 cm
+    right_margin = 57  # ~2.0 cm
+    page_width = width - left_margin - right_margin
+    col_gap = 57  # ~2 cm
+    col_width = (page_width - col_gap) / 2
     left_x = left_margin
-    right_x = left_x + col_width + col_gap
-    title_y = height - top_margin
+    right_x = left_margin + col_width + col_gap
 
-    black = colors.HexColor("#111111")
-    dark_grey = colors.HexColor("#777777")
-    outcome_grey = colors.HexColor("#555555")
+    BLACK = colors.black
+    LABEL = colors.Color(0, 0, 0, alpha=0.55)
+    CHART_PLACEHOLDER = colors.Color(0, 0, 0, alpha=0.18)
 
-    def draw_page_number(page_no: int, total: int) -> None:
-        c.setFillColor(dark_grey)
-        c.setFont("Helvetica", 9)
-        c.drawRightString(width - right_margin, 22, f"{page_no} / {total}")
-        c.setFillColor(black)
+    def page_number(page_no: int, total: int = 2) -> None:
+        c.setFont('Helvetica', 9)
+        c.setFillColor(LABEL)
+        c.drawRightString(width - right_margin, 22, f'{page_no} / {total}')
 
-    def draw_header(page_no: int, total: int) -> float:
-        c.setFillColor(black)
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(left_margin, title_y, f"Trade {trade.trade_id}")
-        draw_page_number(page_no, total)
-        return title_y - 42
+    def draw_title(text: str) -> float:
+        y = height - top_margin
+        c.setFont('Helvetica-Bold', 12)
+        c.setFillColor(BLACK)
+        c.drawString(left_margin, y, text)
+        return y - 42  # ~1.5 cm
 
-    def draw_section_title(title: str, x: float, y: float) -> float:
-        c.setFillColor(black)
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(x, y, title)
-        return y - 20
-
-    def draw_field_column(x: float, y: float, fields: list[tuple[str, str]]) -> float:
-        for label, value in fields:
-            c.setFillColor(dark_grey)
-            c.setFont("Helvetica", 9)
+    def draw_kv_column(x: float, y: float, pairs: list[tuple[str, str]], value_offset: float = 68) -> float:
+        for label, value in pairs:
+            c.setFont('Helvetica', 9)
+            c.setFillColor(LABEL)
             c.drawString(x, y, label)
-            c.setFillColor(black)
-            c.setFont("Helvetica", 9)
-            wrapped = textwrap.wrap(value or "-", width=28) or ["-"]
-            line_y = y - 12
-            for chunk in wrapped:
-                c.drawString(x, line_y, chunk)
-                line_y -= 11
-            y = line_y - 10
+            c.setFont('Helvetica', 9)
+            c.setFillColor(BLACK)
+            c.drawString(x + value_offset, y, value)
+            y -= 28
         return y
 
-    def outcome_text() -> str:
-        pnl = _safe_float(trade.pnl)
-        if pnl is None:
-            return "-"
-        if pnl > 0:
-            return "Gewinn"
-        if pnl < 0:
-            return "Verlust"
-        return "Break-even"
+    def draw_section_heading(text: str, y: float) -> float:
+        c.setFont('Helvetica-Bold', 9)
+        c.setFillColor(BLACK)
+        c.drawString(left_margin, y, text)
+        return y - 28
 
-    def draw_chart_block(y_top: float) -> float:
-        chart_title_y = y_top
-        c.setFillColor(black)
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(left_margin, chart_title_y, "Chart")
-        img_y = chart_title_y - 12 - 255
-        img_x = left_margin
-        img_w = 454
-        img_h = 255
-        chart = _load_chart_image(trade.attachments.get("chart_screenshot"))
-        if chart is not None:
-            try:
-                c.drawImage(chart, img_x, img_y, width=img_w, height=img_h, preserveAspectRatio=True, anchor='sw', mask='auto')
-            except Exception:
-                c.setFont("Helvetica", 9)
-                c.setFillColor(dark_grey)
-                c.drawString(img_x, img_y + img_h / 2, "Chart konnte nicht geladen werden.")
-        else:
-            c.setFont("Helvetica", 9)
-            c.setFillColor(dark_grey)
-            c.drawString(img_x, img_y + img_h / 2, "Kein Chart-Screenshot vorhanden oder abrufbar.")
-        c.setFillColor(black)
-        return img_y - 12
-
-    def draw_wrapped_section(title: str, fields: list[tuple[str, str]], start_y: float) -> float:
-        y = draw_section_title(title, left_margin, start_y)
-        for label, value in fields:
-            c.setFillColor(dark_grey)
-            c.setFont("Helvetica", 9)
+    def draw_vertical_items(y: float, items: list[tuple[str, str]]) -> float:
+        for label, value in items:
+            c.setFont('Helvetica', 9)
+            c.setFillColor(LABEL)
             c.drawString(left_margin, y, label)
-            y -= 12
-            c.setFillColor(black)
-            c.setFont("Helvetica", 9)
-            wrapped = textwrap.wrap(value or "-", width=80) or ["-"]
+            y -= 14
+            c.setFont('Helvetica', 9)
+            c.setFillColor(BLACK)
+            wrapped = textwrap.wrap(value or '-', width=78) or ['-']
             for chunk in wrapped:
                 c.drawString(left_margin, y, chunk)
-                y -= 11
+                y -= 14
             y -= 14
         return y
 
-    # PAGE 1
-    content_top = draw_header(1, 2)
+    def draw_chart(x: float, y: float, w: float, h: float) -> None:
+        chart = _load_chart_image(trade.attachments.get('chart_screenshot'))
+        if chart is not None:
+            try:
+                c.drawImage(chart, x, y, width=w, height=h, preserveAspectRatio=True, anchor='sw', mask='auto')
+                return
+            except Exception:
+                pass
+        c.setStrokeColor(CHART_PLACEHOLDER)
+        c.setLineWidth(0.6)
+        c.rect(x, y, w, h, stroke=1, fill=0)
+        c.setFont('Helvetica', 9)
+        c.setFillColor(LABEL)
+        c.drawString(x + 10, y + h / 2, 'Kein Chart-Screenshot vorhanden oder abrufbar.')
 
-    order_qty = (
-        trade.metrics.get("position_notional_usd")
-        or trade.metrics.get("order_quantity_usd")
-        or trade.journal.get("order_quantity_usd")
-        or trade.journal.get("quantity")
-        or trade.metrics.get("quantity")
-    )
-    leverage_value = trade.metrics.get("leverage") or trade.journal.get("leverage") or "-"
+    def result_text() -> str:
+        pnl = _safe_float(trade.pnl)
+        if pnl is None:
+            return '-'
+        if pnl > 0:
+            return 'Gewinn'
+        if pnl < 0:
+            return 'Verlust'
+        return 'Break-even'
 
-    left_fields = [
-        ("Datum", _format_datetime_long(trade.date)),
-        ("Asset", _as_text(trade.asset)),
-        ("Richtung", _as_text(trade.side)),
-        ("Leverage", _as_text(leverage_value)),
-        ("Ordermenge", _format_currency(order_qty) if order_qty not in (None, "") else "-"),
-        ("Entry Preis", _format_currency(trade.entry_price)),
-        ("Exit Preis", _format_currency(trade.exit_price)),
-        ("Session", _as_text(trade.session)),
-        ("Entry Zeit", _format_datetime_short(trade.entry_time)),
-        ("Exit Zeit", _format_datetime_short(trade.exit_time)),
-        ("Hold Time", _format_hold_time(trade.metrics.get("hold_time_minutes"))),
+    def order_size_text() -> str:
+        qty = trade.metrics.get('position_notional_usd')
+        if qty in (None, ''):
+            qty = trade.journal.get('order_size_usd')
+        if qty in (None, ''):
+            qty = trade.journal.get('quantity')
+        if qty in (None, ''):
+            qty = trade.metrics.get('quantity')
+        if qty in (None, ''):
+            return '-'
+        num = _safe_float(qty)
+        return f'{num:.2f} $' if num is not None else f'{qty} $'
+
+    def leverage_text() -> str:
+        return _as_text(
+            trade.metrics.get('leverage')
+            or trade.journal.get('leverage')
+            or trade.attachments.get('leverage')
+            or trade.journal.get('broker_leverage')
+        )
+
+    def fmt_date_long(value: Any) -> str:
+        dt = _parse_iso_datetime(value)
+        if not dt:
+            return '-'
+        weekdays = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag']
+        months = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember']
+        return f"{weekdays[dt.weekday()]}, {dt.day}. {months[dt.month-1]} {dt.year}"
+
+    def fmt_money(value: Any) -> str:
+        num = _safe_float(value)
+        if num is None:
+            return '-' if value in (None, '') else str(value)
+        s = f'{num:,.2f}'
+        # German-style visual without relying on locale.
+        s = s.replace(',', 'X').replace('.', ',').replace('X', '.')
+        return f'{s} $'
+
+    def fmt_number(value: Any, suffix: str = '') -> str:
+        num = _safe_float(value)
+        if num is None:
+            return '-' if value in (None, '') else str(value)
+        s = f'{num:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+        return f'{s}{suffix}'
+
+    def fmt_r(value: Any) -> str:
+        num = _safe_float(value)
+        if num is None:
+            return '-' if value in (None, '') else str(value)
+        s = f'{num:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+        return f'{s}R'
+
+    # Page 1
+    y = draw_title(f'Trade {trade.trade_id}')
+
+    left_pairs = [
+        ('Datum', fmt_date_long(trade.date)),
+        ('Asset', _as_text(trade.asset)),
+        ('Richtung', _as_text(trade.side)),
+        ('Leverage', leverage_text()),
+        ('Ordermenge', order_size_text()),
+        ('Entry Preis', fmt_money(trade.entry_price)),
+        ('Exit Preis', fmt_money(trade.exit_price)),
+        ('Session', _as_text(trade.session)),
+        ('Entry Zeit', _format_datetime(trade.entry_time)),
+        ('Exit Zeit', _format_datetime(trade.exit_time)),
+        ('Hold Time', _format_hold_time(trade.metrics.get('hold_time_minutes'))),
     ]
-
-    right_fields = [
-        ("Ergebnis", outcome_text()),
-        ("PnL", _format_currency(trade.pnl, "")),
-        ("ROI", _format_number(trade.metrics.get("roi_percent"), 2, "%")),
-        ("R-Multiple", f"{_format_number(trade.risk_reward)}R" if trade.risk_reward not in (None, "") else "-"),
-        ("Netto n. Fees", _format_currency(trade.metrics.get("net_profit_after_fees"), "")),
-        ("Setup", _as_text(trade.setup)),
-        ("Bewertung", _as_text(trade.journal.get("setup_rating"))),
-        ("Stop Loss", _format_currency(trade.journal.get("stop_loss"))),
-        ("Take Profit", _format_currency(trade.journal.get("take_profit"))),
-        ("MFE", _format_number(trade.metrics.get("mfe"))),
-        ("MAE", _format_number(trade.metrics.get("mae"))),
+    right_pairs = [
+        ('Ergebnis', result_text()),
+        ('PnL', fmt_money(trade.pnl)),
+        ('ROI', fmt_number(trade.metrics.get('roi_percent'), '%')),
+        ('R-Multiple', fmt_r(trade.risk_reward)),
+        ('Netto n. Fees', fmt_money(trade.metrics.get('net_profit_after_fees'))),
+        ('Setup', _as_text(trade.setup)),
+        ('Bewertung', _as_text(trade.journal.get('setup_rating'))),
+        ('Stop Loss', fmt_money(trade.journal.get('stop_loss'))),
+        ('Take Profit', fmt_money(trade.journal.get('take_profit'))),
+        ('MFE', fmt_money(trade.metrics.get('mfe'))),
+        ('MAE', fmt_money(trade.metrics.get('mae'))),
     ]
+    left_end = draw_kv_column(left_x, y, left_pairs)
+    right_end = draw_kv_column(right_x, y, right_pairs)
 
-    left_end = draw_field_column(left_x, content_top, left_fields)
-    right_end = draw_field_column(right_x, content_top, right_fields)
-    chart_start_y = min(left_end, right_end) - 12
-    draw_chart_block(chart_start_y)
+    chart_h = 255  # ~9 cm
+    chart_w = 454  # ~16 cm
+    chart_y = bottom_margin + 18
+    draw_chart(left_margin, chart_y, chart_w, chart_h)
+    page_number(1)
 
+    # Page 2
     c.showPage()
+    y = draw_title(f'Trade {trade.trade_id}')
 
-    # PAGE 2
-    content_top = draw_header(2, 2)
-    y = draw_wrapped_section(
-        "Psychologie",
-        [
-            ("Vor dem Trade", _as_text(trade.journal.get("emotion_before"))),
-            ("Während des Trades", _as_text(trade.journal.get("emotion_during"))),
-            ("Nach dem Exit", _as_text(trade.journal.get("emotion_after"))),
-        ],
-        content_top,
-    )
-    y = draw_wrapped_section(
-        "Lessons Learned",
-        [
-            ("Gut", _as_text(trade.journal.get("lessons_good"))),
-            ("Schlecht", _as_text(trade.journal.get("lessons_bad"))),
-            ("Nächstes Mal", _as_text(trade.journal.get("lessons_next_time"))),
-        ],
-        y,
-    )
-    y = draw_wrapped_section(
-        "Live Coaching",
-        [
-            ("Botbewertung", _as_text(trade.bot_assessment.get("rating"))),
-            ("Kurzfazit", _as_text(trade.bot_assessment.get("summary"))),
-            ("Stärken", _format_list(trade.bot_assessment.get("strengths"))),
-            ("Schwächen", _format_list(trade.bot_assessment.get("weaknesses"))),
-            ("Coaching", _as_text(trade.bot_assessment.get("live_coaching"))),
-        ],
-        y,
-    )
-    draw_wrapped_section(
-        "Weitere Notizen",
-        [("Notizen", _as_text(trade.notes))],
-        y,
-    )
+    y = draw_section_heading('Psychologie', y)
+    y = draw_vertical_items(y, [
+        ('Vor dem Trade', _as_text(trade.journal.get('emotion_before'))),
+        ('Während des Trades', _as_text(trade.journal.get('emotion_during'))),
+        ('Nach dem Exit', _as_text(trade.journal.get('emotion_after'))),
+    ])
 
+    y -= 10
+    y = draw_section_heading('Lessons Learned', y)
+    y = draw_vertical_items(y, [
+        ('Gut', _as_text(trade.journal.get('lessons_good'))),
+        ('Schlecht', _as_text(trade.journal.get('lessons_bad'))),
+        ('Nächstes Mal', _as_text(trade.journal.get('lessons_next_time'))),
+    ])
+
+    y -= 10
+    y = draw_section_heading('Live Coaching', y)
+    y = draw_vertical_items(y, [
+        ('Botbewertung', _as_text(trade.bot_assessment.get('rating'))),
+        ('Kurzfazit', _as_text(trade.bot_assessment.get('summary'))),
+        ('Stärken', _format_list(trade.bot_assessment.get('strengths'))),
+        ('Schwächen', _format_list(trade.bot_assessment.get('weaknesses'))),
+        ('Coaching', _as_text(trade.bot_assessment.get('live_coaching'))),
+    ])
+
+    if trade.notes not in (None, ''):
+        y -= 10
+        y = draw_section_heading('Weitere Notizen', y)
+        y = draw_vertical_items(y, [('Notizen', _as_text(trade.notes))])
+
+    page_number(2)
     c.save()
     pdf = buffer.getvalue()
     buffer.close()
     return pdf
-
 
 def upload_to_dropbox(dbx: dropbox.Dropbox, folder: str, filename: str, payload: bytes) -> dict[str, str]:
     remote_path = f"{folder}/{filename}"
